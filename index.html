@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>HandMusic — Webcam + Manos (MediaPipe) → Audio en tiempo real</title>
+<style>
+  :root{
+    --bg:#0b1020;--fg:#e6ecff;--muted:#9fb0ff;--accent:#6ee7ff;--good:#66ffb3;--warn:#ffd166;--bad:#ff6b6b;
+    --card:#141a33;--line:#29304d;
+  }
+  html,body{height:100%;}
+  body{margin:0;background:radial-gradient(1200px 800px at 10% 10%, #101735 0%, #070b18 55%, #04060f 100%);color:var(--fg);font:15px/1.35 system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;}
+  .app{display:grid;grid-template-columns:1.2fr 1fr;gap:14px;min-height:100vh;padding:16px;}
+  .pane{background:var(--card);border:1px solid var(--line);border-radius:16px;box-shadow:0 10px 30px rgba(0,0,0,.35);}
+  .stage{position:relative;overflow:hidden;}
+  .stage video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;filter:contrast(1.05) saturate(1.05) brightness(.95) hue-rotate(2deg);opacity:.13;}
+  .stage canvas{position:absolute;inset:0;width:100%;height:100%;}
+  .hud{position:absolute;left:12px;bottom:12px;background:rgba(20,26,51,.6);backdrop-filter:blur(6px);border:1px solid var(--line);border-radius:12px;padding:10px 12px;display:flex;gap:10px;align-items:center}
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--bad);} 
+  .dot.live{background:var(--good);box-shadow:0 0 10px var(--good)}
+  .fps{opacity:.85}
+  .side{padding:16px 16px 20px 16px;display:grid;gap:14px;align-content:start}
+  .card{border:1px solid var(--line);background:linear-gradient(180deg, #171d38, #121730);padding:14px;border-radius:14px}
+  .title{font-weight:700;letter-spacing:.2px}
+  .controls{display:grid;gap:10px}
+  .row{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  select,button,input[type="range"],.kbd{width:100%}
+  select,button{background:#0f1430;border:1px solid #2a3355;color:var(--fg);padding:10px;border-radius:12px}
+  select:focus,button:focus{outline:2px solid var(--accent);outline-offset:2px}
+  .kbd{display:inline-grid;grid-template-columns:repeat(5,1fr);gap:8px}
+  .key{background:#0e1433;border:1px solid #2a3355;border-radius:10px;padding:8px;text-align:center}
+  .key.on{border-color:var(--good);box-shadow:0 0 0 1px var(--good) inset, 0 0 12px rgba(102,255,179,.35)}
+  .mini{font-size:12px;color:var(--muted)}
+  .help{color:var(--muted)}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .slider{display:grid;gap:6px}
+  .badge{display:inline-block;padding:2px 8px;border-radius:999px;background:#0c1330;border:1px solid #2a3355;color:var(--muted);font-size:12px}
+  .note-map{display:grid;grid-template-columns:repeat(5,1fr);gap:8px}
+  .note-map select{font-size:13px}
+  .link{color:var(--accent)}
+</style>
+</head>
+<body>
+  <div class="app">
+    <div class="pane stage">
+      <video id="video" playsinline></video>
+      <canvas id="canvas"></canvas>
+      <div class="hud"><span class="dot" id="liveDot"></span><span id="status">Cámara</span> · <span class="fps" id="fps">0 fps</span></div>
+    </div>
+    <div class="pane side">
+      <div class="card">
+        <div class="title">Instrumento y latencia</div>
+        <div class="controls grid2" style="margin-top:8px">
+          <label>Instrumento
+            <select id="instrument">
+              <option value="piano">Piano</option>
+              <option value="guitarra">Guitarra</option>
+              <option value="violin">Violín</option>
+              <option value="synth" selected>Sintetizador</option>
+            </select>
+          </label>
+          <label>Ganancia
+            <input id="gain" type="range" min="0" max="1" step="0.01" value="0.6"/>
+          </label>
+        </div>
+        <div class="controls grid2">
+          <label>Ataque
+            <input id="attack" type="range" min="0" max="0.25" step="0.005" value="0.01"/>
+          </label>
+          <label>Decaimiento
+            <input id="decay" type="range" min="0" max="1.2" step="0.01" value="0.12"/>
+          </label>
+        </div>
+        <div class="controls grid2">
+          <label>Sustain
+            <input id="sustain" type="range" min="0" max="1" step="0.01" value="0.7"/>
+          </label>
+          <label>Release
+            <input id="release" type="range" min="0" max="1.2" step="0.01" value="0.2"/>
+          </label>
+        </div>
+        <div class="mini">Pista: para menor latencia, cierre otras pestañas/capturas. WebAudio aquí usa <em>interactive latency hint</em>.</div>
+      </div>
+
+      <div class="card">
+        <div class="title">Asignación de notas por dedo</div>
+        <div class="mini">Pulgar→Índice→Medio→Anular→Meñique. Cambia la tónica/base de cada dedo.</div>
+        <div id="noteMap" class="note-map" style="margin-top:8px"></div>
+      </div>
+
+      <div class="card">
+        <div class="title">Gestos y modulación</div>
+        <div class="controls" style="margin-top:8px">
+          <label><input type="checkbox" id="pitchByY" checked> Altura del dedo (Y) = cambio de tono (±4 semitonos)</label>
+          <label><input type="checkbox" id="volByOpen" checked> Apertura de mano = volumen</label>
+          <label><input type="checkbox" id="autoPedal" checked> Puño cerrado = todo en silencio</label>
+          <div class="slider">
+            <span class="mini">Sensibilidad vertical</span>
+            <input id="ySensitivity" type="range" min="0.5" max="2.0" step="0.05" value="1.0"/>
+          </div>
+        </div>
+        <div class="kbd" id="kbd">
+          <div class="key" id="k0">Pulgar</div>
+          <div class="key" id="k1">Índice</div>
+          <div class="key" id="k2">Medio</div>
+          <div class="key" id="k3">Anular</div>
+          <div class="key" id="k4">Meñique</div>
+        </div>
+      </div>
+
+      <div class="card help">
+        <div class="title">Cómo se toca</div>
+        <ul>
+          <li>Extiende un dedo (que su punta esté por encima de su PIP) para activar su nota.</li>
+          <li>Mueve ese dedo hacia arriba/abajo: cambia el tono (si está activado arriba).</li>
+          <li>Abre la mano para más volumen; cierra el puño para silencio inmediato.</li>
+          <li>El selector cambia el carácter del instrumento y su envolvente.</li>
+        </ul>
+        <div class="mini">Privacidad: todo ocurre localmente en tu navegador; no se envía video a ningún servidor.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- MediaPipe Hands + utils desde CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+
+<script>
+(() => {
+  const video = document.getElementById('video');
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+  const liveDot = document.getElementById('liveDot');
+  const statusEl = document.getElementById('status');
+  const fpsEl = document.getElementById('fps');
+
+  // UI controls
+  const instrumentSel = document.getElementById('instrument');
+  const gainSl = document.getElementById('gain');
+  const attackSl = document.getElementById('attack');
+  const decaySl = document.getElementById('decay');
+  const sustainSl = document.getElementById('sustain');
+  const releaseSl = document.getElementById('release');
+  const pitchByY = document.getElementById('pitchByY');
+  const volByOpen = document.getElementById('volByOpen');
+  const autoPedal = document.getElementById('autoPedal');
+  const ySensitivity = document.getElementById('ySensitivity');
+  const kbdKeys = [...document.querySelectorAll('.key')];
+  const noteMapDiv = document.getElementById('noteMap');
+
+  // Finger indices in MediaPipe (thumb, index, middle, ring, pinky) tips & MCP
+  const TIP = [4, 8, 12, 16, 20];
+  const PIP = [3, 6, 10, 14, 18];
+  const MCP = [2, 5, 9, 13, 17];
+
+  // ---------- WebAudio Engine ----------
+  const AudioCtx = window.AudioContext || window.webkitAudioContext;
+  const audio = new AudioCtx({ latencyHint: 'interactive' });
+  let master = audio.createGain();
+  master.gain.value = parseFloat(gainSl.value);
+  master.connect(audio.destination);
+
+  function midiToFreq(m){ return 440 * Math.pow(2, (m-69)/12); }
+
+  const BASE_NOTES = [60, 64, 67, 71, 74]; // C4, E4, G4, B4, D5 por defecto
+  const NOTE_NAMES = [
+    'C','C#','D','D#','E','F','F#','G','G#','A','A#','B'
+  ];
+
+  function noteName(m){
+    const n = m % 12; const o = Math.floor(m/12)-1; return NOTE_NAMES[n] + o;
+  }
+
+  // UI para asignar nota por dedo
+  function buildNoteSelectors(){
+    noteMapDiv.innerHTML = '';
+    for(let i=0;i<5;i++){
+      const sel = document.createElement('select');
+      sel.dataset.finger = i;
+      // Rango razonable: 48..84 (C3..C6)
+      for(let m=48;m<=84;m++){
+        const opt = document.createElement('option');
+        opt.value = m; opt.textContent = noteName(m);
+        if(m===BASE_NOTES[i]) opt.selected = true;
+        sel.appendChild(opt);
+      }
+      sel.oninput = () => { voices[i].baseMidi = parseInt(sel.value); };
+      noteMapDiv.appendChild(sel);
+    }
+  }
+
+  // Voz por dedo
+  class Voice{
+    constructor(baseMidi){
+      this.baseMidi = baseMidi;
+      this.gain = audio.createGain();
+      this.gain.gain.value = 0;
+      this.gain.connect(master);
+      this.osc = null; this.filter = null; this.active=false;
+      this.targetFreq = midiToFreq(baseMidi);
+      this.currentFreq = this.targetFreq;
+    }
+    setInstrument(name){
+      // cierre y re-creación para cambiar carácter
+      if(this.osc){ this.osc.stop(); this.osc.disconnect(); this.osc=null; }
+      if(this.filter){ this.filter.disconnect(); this.filter=null; }
+
+      const osc = audio.createOscillator();
+      const filter = audio.createBiquadFilter();
+      filter.type = 'lowpass';
+
+      switch(name){
+        case 'piano':
+          osc.type = 'square'; filter.frequency.value = 2200; break;
+        case 'guitarra':
+          osc.type = 'triangle'; filter.frequency.value = 1800; break;
+        case 'violin':
+          osc.type = 'sawtooth'; filter.frequency.value = 3200; break;
+        default:
+          osc.type = 'sine'; filter.frequency.value = 5000; break;
+      }
+      osc.connect(filter);
+      filter.connect(this.gain);
+      osc.frequency.value = this.currentFreq;
+      osc.start();
+      this.osc = osc; this.filter = filter;
+    }
+    trigger(on){
+      const t = audio.currentTime;
+      const A = parseFloat(attackSl.value);
+      const D = parseFloat(decaySl.value);
+      const S = parseFloat(sustainSl.value);
+      const R = parseFloat(releaseSl.value);
+      if(on){
+        this.active = true;
+        const v0 = this.gain.gain.value;
+        this.gain.gain.cancelScheduledValues(t);
+        this.gain.gain.setValueAtTime(v0, t);
+        this.gain.gain.linearRampToValueAtTime(1.0, t + A);
+        this.gain.gain.linearRampToValueAtTime(S, t + A + D);
+      } else {
+        this.active = false;
+        this.gain.gain.cancelScheduledValues(t);
+        this.gain.gain.setTargetAtTime(0, t, R*0.6 + 0.03);
+      }
+    }
+    setVolume(v){
+      // escala adicional por apertura de mano: multiplicamos la envolvente actual
+      this.gain.gain.setTargetAtTime(Math.max(0, Math.min(1, v)), audio.currentTime, 0.015);
+    }
+    setPitchFromMidi(m){
+      this.targetFreq = midiToFreq(m);
+      if(this.osc){ this.osc.frequency.setTargetAtTime(this.targetFreq, audio.currentTime, 0.01); }
+      this.currentFreq = this.targetFreq;
+    }
+    bendSemitones(st){
+      const f = midiToFreq(this.baseMidi + st);
+      if(this.osc){ this.osc.frequency.setTargetAtTime(f, audio.currentTime, 0.012); }
+      this.currentFreq = f;
+    }
+  }
+
+  const voices = BASE_NOTES.map(n => new Voice(n));
+  function setInstrumentAll(name){ voices.forEach(v => v.setInstrument(name)); }
+
+  // inicialización de UI y audio
+  buildNoteSelectors();
+  setInstrumentAll(instrumentSel.value);
+
+  // control handlers
+  gainSl.oninput = () => { master.gain.value = parseFloat(gainSl.value); };
+  instrumentSel.oninput = () => setInstrumentAll(instrumentSel.value);
+
+  // Visuals
+  function resize(){
+    const r = video.getBoundingClientRect();
+    canvas.width = r.width * devicePixelRatio;
+    canvas.height = r.height * devicePixelRatio;
+  }
+  window.addEventListener('resize', resize);
+
+  // Helpers de mano
+  function isFingerExtended(landmarks, i){
+    // En y de pantalla, menor = más arriba. Si TIP y < PIP y, consideramos extendido
+    return landmarks[TIP[i]].y < landmarks[PIP[i]].y - 0.02;
+  }
+  function handOpenness(landmarks){
+    // promedio de distancias TIP-MCP normalizado al ancho de la mano (pulgar->meñique MCP)
+    const w = Math.hypot(
+      landmarks[MCP[4]].x - landmarks[MCP[1]].x,
+      landmarks[MCP[4]].y - landmarks[MCP[1]].y
+    ) + 1e-6;
+    let sum=0;
+    for(let i=0;i<5;i++){
+      const d = Math.hypot(
+        landmarks[TIP[i]].x - landmarks[MCP[i]].x,
+        landmarks[TIP[i]].y - landmarks[MCP[i]].y
+      );
+      sum += d / w;
+    }
+    return Math.min(1, Math.max(0, (sum/5 - 0.25) / 0.6)); // escala suave 0..1
+  }
+
+  // Pitch por desplazamiento vertical relativo al MCP
+  function verticalSemitones(landmarks, i){
+    const dy = (landmarks[MCP[i]].y - landmarks[TIP[i]].y); // arriba positivo
+    const scaled = dy * 30 * parseFloat(ySensitivity.value); // factor empírico
+    return Math.max(-6, Math.min(6, scaled));
+  }
+
+  // Estado anterior para re-disparo si baja y sube rápido (ataque)
+  const prev = { extended:[false,false,false,false,false], lastTime: performance.now() };
+
+  // FPS
+  let lastT = performance.now(); let frames=0;
+  const fpsTimer = setInterval(()=>{
+    fpsEl.textContent = fps.toFixed(0) + ' fps';
+    fps = 0;
+  }, 1000);
+  let fps=0;
+
+  // -------- MediaPipe Hands setup --------
+  const hands = new Hands({ locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+  hands.setOptions({
+    maxNumHands: 1,
+    modelComplexity: 1,
+    minDetectionConfidence: 0.6,
+    minTrackingConfidence: 0.6,
+    selfieMode: true
+  });
+  hands.onResults(onResults);
+
+  const camera = new Camera(video, {
+    onFrame: async () => { await hands.send({ image: video }); },
+    width: 960, height: 540
+  });
+
+  // Inicio al primer gesto del usuario para permitir AudioContext
+  function ensureAudioStart(){ if(audio.state !== 'running') audio.resume(); }
+  window.addEventListener('pointerdown', ensureAudioStart, { once:true });
+
+  camera.start().then(()=>{
+    statusEl.textContent = 'Cámara lista'; liveDot.classList.add('live');
+    // esperar layout para dimensionar canvas
+    setTimeout(resize, 120);
+  }).catch(err=>{
+    statusEl.textContent = 'Error de cámara: ' + err.message;
+  });
+
+  function drawLandmarks(landmarks){
+    const w = canvas.width, h = canvas.height;
+    ctx.clearRect(0,0,w,h);
+    // huesos (conexiones)
+    const C = Hands.HAND_CONNECTIONS || window.HAND_CONNECTIONS; // compat
+    ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(110,231,255,.6)';
+    ctx.beginPath();
+    C.forEach(([a,b]) => {
+      const p = landmarks[a], q = landmarks[b];
+      ctx.moveTo(p.x*w, p.y*h); ctx.lineTo(q.x*w, q.y*h);
+    });
+    ctx.stroke();
+    // puntitos
+    ctx.fillStyle = 'rgba(255,255,255,.9)';
+    for(const p of landmarks){ ctx.beginPath(); ctx.arc(p.x*w, p.y*h, 5, 0, Math.PI*2); ctx.fill(); }
+  }
+
+  function onResults(results){
+    frames++; const now = performance.now();
+    if(results.multiHandLandmarks && results.multiHandLandmarks.length){
+      const lm = results.multiHandLandmarks[0];
+      drawLandmarks(lm);
+
+      // apertura → volumen maestro
+      if(volByOpen.checked){
+        const open = handOpenness(lm);
+        master.gain.setTargetAtTime(parseFloat(gainSl.value) * open, audio.currentTime, 0.02);
+      }
+
+      // activación por dedo + pitch
+      for(let i=0;i<5;i++){
+        const isOn = isFingerExtended(lm, i);
+        const v = voices[i];
+        const keyEl = kbdKeys[i];
+        if(isOn && !prev.extended[i]){ v.trigger(true); keyEl.classList.add('on'); }
+        if(!isOn && prev.extended[i]){ v.trigger(false); keyEl.classList.remove('on'); }
+        if(isOn){
+          const bend = pitchByY.checked ? verticalSemitones(lm, i) : 0;
+          v.bendSemitones(bend);
+        }
+        prev.extended[i] = isOn;
+      }
+
+      // auto-pedal: puño (nadie extendido) = silencio
+      if(autoPedal.checked){
+        const any = prev.extended.some(Boolean);
+        if(!any){ voices.forEach(v=>v.trigger(false)); kbdKeys.forEach(k=>k.classList.remove('on')); }
+      }
+
+    } else {
+      // no hay manos
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+      if(autoPedal.checked){ voices.forEach(v=>v.trigger(false)); kbdKeys.forEach(k=>k.classList.remove('on')); }
+    }
+  }
+
+})();
+</script>
+</body>
+</html>
